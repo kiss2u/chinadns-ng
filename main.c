@@ -174,6 +174,7 @@ static void handle_local_packet(void) {
     MYHASH_ADD(s_context_list, context, &context->unique_msgid, sizeof(context->unique_msgid));
 }
 
+/* name_tag: NAME_TAG_NONE */
 static inline bool accept_chinadns_reply(const void *noalias packet_buf, ssize_t packet_len, int namelen) {
     uint16_t qtype = dns_qtype(packet_buf, namelen);
     if (qtype != DNS_RECORD_TYPE_A && qtype != DNS_RECORD_TYPE_AAAA)
