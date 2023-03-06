@@ -157,8 +157,9 @@ static void handle_local_packet(void) {
         }
     }
 
-    if (!sent) {
+    if (!sent) { /* caused by no aaaa query (china or trust) */
         dns_header->id = origin_msgid;
+        LOGV("filter [%s] AAAA query, rule: %s", s_name_buf, (g_noaaaa_query & NOAAAA_CHINA_DNS) ? "chinadns" : "trustdns");
         reply_with_no_answer(&source_addr, source_addrlen, s_packet_buf, packet_len);
         return;
     }
