@@ -158,6 +158,7 @@ static void handle_local_packet(void) {
     }
 
     if (!sent) {
+        dns_header->id = origin_msgid;
         reply_with_no_answer(&source_addr, source_addrlen, s_packet_buf, packet_len);
         return;
     }
