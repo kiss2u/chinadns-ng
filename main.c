@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <signal.h>
+#include <assert.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
@@ -56,6 +57,37 @@ static char          s_ipstr_buf[INET6_ADDRSTRLEN]   = {0};
     free(ctx); \
 })
 
+static inline const char *filter_aaaa_by_tag(uint8_t name_tag) {
+    if (!(g_noaaaa_query & (NOAAAA_TAG_GFW | NOAAAA_TAG_CHN | NOAAAA_TAG_NONE)))
+        return NULL;
+    else if (is_filter_all_v6(g_noaaaa_query))
+        return "all";
+    else {
+        switch (name_tag) {
+            case NAME_TAG_GFW:
+                return (g_noaaaa_query & NOAAAA_TAG_GFW) ? "tag_gfw" : NULL;
+            case NAME_TAG_CHN:
+                return (g_noaaaa_query & NOAAAA_TAG_CHN) ? "tag_chn" : NULL;
+            case NAME_TAG_NONE:
+                return (g_noaaaa_query & NOAAAA_TAG_NONE) ? "tag_none" : NULL;
+            default:
+                assert(0);
+                return NULL;
+        }
+    }
+}
+
+static inline void reply_with_no_answer(const skaddr_u *noalias addr, socklen_t addrlen, void *noalias query, size_t querylen) {
+    dns_header_t *header = query;
+    header->qr = DNS_QR_REPLY;
+    header->rcode = DNS_RCODE_NOERROR;
+    unlikely_if (sendto(s_bind_sockfd, query, querylen, 0, &addr->sa, addrlen) < 0) {
+        portno_t port = 0;
+        parse_socket_addr(addr, s_ipstr_buf, &port);
+        LOGE("failed to send reply to %s#%u: (%d) %s", s_ipstr_buf, (uint)port, errno, strerror(errno));
+    }
+}
+
 /* handle local socket readable event */
 static void handle_local_packet(void) {
     unlikely_if (MYHASH_CNT(s_context_list) >= 65536U) { /* range:0~65535, count:65536 */
@@ -69,7 +101,7 @@ static void handle_local_packet(void) {
 
     if (packet_len < 0) {
         unlikely_if (errno != EAGAIN && errno != EWOULDBLOCK)
-            LOGE("failed to recv data from bind socket: (%d) %s", errno, strerror(errno));
+            LOGE("failed to recv from bind socket: (%d) %s", errno, strerror(errno));
         return;
     }
 
@@ -88,38 +120,11 @@ static void handle_local_packet(void) {
         LOGI("query [%s] from %s#%u (%u)", s_name_buf, s_ipstr_buf, (uint)port, (uint)s_unique_msgid);
     }
 
-    if (g_noaaaa_query & (NOAAAA_TAG_GFW | NOAAAA_TAG_CHN | NOAAAA_TAG_NONE) && qtype == DNS_RECORD_TYPE_AAAA) {
-        bool filter = false;
-        const char *rule = "(null)";
-        if (is_filter_all_v6(g_noaaaa_query)) {
-            filter = true;
-            rule = "all";
-        } else {
-            switch (name_tag) {
-                case NAME_TAG_GFW:
-                    filter = g_noaaaa_query & NOAAAA_TAG_GFW;
-                    rule = "tag_gfw";
-                    break;
-                case NAME_TAG_CHN:
-                    filter = g_noaaaa_query & NOAAAA_TAG_CHN;
-                    rule = "tag_chn";
-                    break;
-                case NAME_TAG_NONE:
-                    filter = g_noaaaa_query & NOAAAA_TAG_NONE;
-                    rule = "tag_none";
-                    break;
-            }
-        }
-        if (filter) {
+    if (qtype == DNS_RECORD_TYPE_AAAA) {
+        const char *rule = filter_aaaa_by_tag(name_tag);
+        if (rule) {
             LOGV("filter [%s] AAAA query, rule: %s", s_name_buf, rule);
-            dns_header_t *header = s_packet_buf;
-            header->qr = DNS_QR_REPLY;
-            header->rcode = DNS_RCODE_NOERROR;
-            unlikely_if (sendto(s_bind_sockfd, s_packet_buf, packet_len, 0, &source_addr.sa, source_addrlen) < 0) {
-                portno_t port = 0;
-                parse_socket_addr(&source_addr, s_ipstr_buf, &port);
-                LOGE("failed to send dns reply packet to %s#%u: (%d) %s", s_ipstr_buf, (uint)port, errno, strerror(errno));
-            }
+            reply_with_no_answer(&source_addr, source_addrlen, s_packet_buf, packet_len);
             return;
         }
     }
@@ -128,6 +133,8 @@ static void handle_local_packet(void) {
     dns_header_t *dns_header = s_packet_buf;
     uint16_t origin_msgid = dns_header->id;
     dns_header->id = unique_msgid; /* replace with new msgid */
+
+    bool sent = false;
 
     for (int i = 0; i <= SERVER_MAXIDX; ++i) {
         if (s_remote_sockfds[i] < 0) continue;
@@ -140,13 +147,19 @@ static void handle_local_packet(void) {
             if (g_noaaaa_query & NOAAAA_TRUST_DNS && qtype == DNS_RECORD_TYPE_AAAA) continue;
             send_times = g_repeat_times;
         }
+        sent = true;
         const skaddr_u *addr = &g_remote_skaddrs[i];
         socklen_t addrlen = skaddr_size(addr);
         for (int j = 0; j < send_times; ++j) {
             LOGV("forward [%s] to %s (%s)", s_name_buf, g_remote_ipports[i], is_chinadns_idx(i) ? "chinadns" : "trustdns");
             unlikely_if (sendto(s_remote_sockfds[i], s_packet_buf, packet_len, 0, &addr->sa, addrlen) < 0)
-                LOGE("failed to send dns query packet to %s: (%d) %s", g_remote_ipports[i], errno, strerror(errno));
+                LOGE("failed to send query to %s: (%d) %s", g_remote_ipports[i], errno, strerror(errno));
         }
+    }
+
+    if (!sent) {
+        reply_with_no_answer(&source_addr, source_addrlen, s_packet_buf, packet_len);
+        return;
     }
 
     queryctx_t *context = malloc(sizeof(queryctx_t));
@@ -164,6 +177,9 @@ static inline bool accept_chinadns_reply(const void *noalias packet_buf, ssize_t
     uint16_t qtype = dns_qtype(packet_buf, namelen);
     if (qtype != DNS_RECORD_TYPE_A && qtype != DNS_RECORD_TYPE_AAAA)
         return true; /* only filter A/AAAA reply */
+
+    if (qtype == DNS_RECORD_TYPE_AAAA && g_noaaaa_query & NOAAAA_TRUST_DNS)
+        return true; /* accept if trust-dns no aaaa query */
 
     int res = dns_chnip_check(packet_buf, packet_len, namelen);
     if (res == DNS_IPCHK_IS_CHNIP)
@@ -183,7 +199,7 @@ static void handle_remote_packet(int index) {
 
     if (packet_len < 0) {
         unlikely_if (errno != EAGAIN && errno != EWOULDBLOCK)
-            LOGE("failed to recv data from %s: (%d) %s", remote_ipport, errno, strerror(errno));
+            LOGE("failed to recv from %s: (%d) %s", remote_ipport, errno, strerror(errno));
         return;
     }
 
@@ -241,7 +257,7 @@ static void handle_remote_packet(int index) {
     unlikely_if (sendto(s_bind_sockfd, reply_buffer, reply_length, 0, &context->source_addr.sa, source_addrlen) < 0) {
         portno_t port = 0;
         parse_socket_addr(&context->source_addr, s_ipstr_buf, &port);
-        LOGE("failed to send dns reply packet to %s#%u: (%d) %s", s_ipstr_buf, (uint)port, errno, strerror(errno));
+        LOGE("failed to send reply to %s#%u: (%d) %s", s_ipstr_buf, (uint)port, errno, strerror(errno));
     }
     free_context(context);
 }
